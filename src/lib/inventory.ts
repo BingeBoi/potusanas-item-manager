@@ -3,10 +3,12 @@ import "server-only";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { assertPersistentStore, getSql, usesOnlineDatabase } from "@/lib/db";
 import type { InventoryItem, InventoryItemInput } from "@/lib/inventory-types";
 
 type InventoryStore = Record<string, InventoryItem[]>;
 const inventoryFile = path.join(process.cwd(), "data", "inventory.json");
+export const GUEST_USER_ID = "prototype-guest";
 
 async function getStore(): Promise<InventoryStore> {
   try {
@@ -33,19 +35,63 @@ export function validateItem(input: unknown): InventoryItemInput {
   return { name, sku, location, quantity };
 }
 
+function toItem(row: Record<string, unknown>): InventoryItem {
+  const updatedAt = row.updatedAt ?? row.updated_at;
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    sku: String(row.sku ?? ""),
+    location: String(row.location ?? ""),
+    quantity: Number(row.quantity),
+    updatedAt: updatedAt instanceof Date ? updatedAt.toISOString() : String(updatedAt),
+  };
+}
+
 export async function getItems(userId: string) {
+  assertPersistentStore();
+  if (usesOnlineDatabase()) {
+    const sql = await getSql();
+    const rows = await sql`
+      SELECT id, name, sku, location, quantity, updated_at AS "updatedAt"
+      FROM items
+      WHERE user_id = ${userId}
+      ORDER BY updated_at DESC
+    `;
+    return rows.map(toItem);
+  }
   return (await getStore())[userId] ?? [];
 }
 
 export async function addItem(userId: string, input: InventoryItemInput) {
-  const store = await getStore();
   const item: InventoryItem = { id: randomBytes(12).toString("hex"), ...input, updatedAt: new Date().toISOString() };
+  assertPersistentStore();
+  if (usesOnlineDatabase()) {
+    const sql = await getSql();
+    await sql`
+      INSERT INTO items (id, user_id, name, sku, location, quantity, updated_at)
+      VALUES (${item.id}, ${userId}, ${item.name}, ${item.sku}, ${item.location}, ${item.quantity}, ${item.updatedAt})
+    `;
+    return item;
+  }
+  const store = await getStore();
   store[userId] = [item, ...(store[userId] ?? [])];
   await saveStore(store);
   return item;
 }
 
 export async function updateItem(userId: string, id: string, input: InventoryItemInput) {
+  assertPersistentStore();
+  if (usesOnlineDatabase()) {
+    const sql = await getSql();
+    const updatedAt = new Date().toISOString();
+    const rows = await sql`
+      UPDATE items
+      SET name = ${input.name}, sku = ${input.sku}, location = ${input.location}, quantity = ${input.quantity}, updated_at = ${updatedAt}
+      WHERE id = ${id} AND user_id = ${userId}
+      RETURNING id, name, sku, location, quantity, updated_at AS "updatedAt"
+    `;
+    return rows[0] ? toItem(rows[0]) : null;
+  }
   const store = await getStore();
   const items = store[userId] ?? [];
   const index = items.findIndex((item) => item.id === id);
@@ -58,6 +104,16 @@ export async function updateItem(userId: string, id: string, input: InventoryIte
 }
 
 export async function deleteItem(userId: string, id: string) {
+  assertPersistentStore();
+  if (usesOnlineDatabase()) {
+    const sql = await getSql();
+    const rows = await sql`
+      DELETE FROM items
+      WHERE id = ${id} AND user_id = ${userId}
+      RETURNING id
+    `;
+    return rows.length > 0;
+  }
   const store = await getStore();
   const items = store[userId] ?? [];
   if (!items.some((item) => item.id === id)) return false;

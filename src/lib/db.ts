@@ -1,8 +1,6 @@
 import "server-only";
 
-import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
-
-type Sql = NeonQueryFunction<false, false>;
+type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>;
 
 let sql: Sql | null = null;
 let schemaReady: Promise<void> | null = null;
@@ -17,20 +15,61 @@ export function assertPersistentStore() {
   }
 }
 
+function neonSql(databaseUrl: string): Sql {
+  const parsed = new URL(databaseUrl);
+  const endpoint = `${parsed.protocol}//${parsed.host}/sql`;
+
+  return async (strings, ...values) => {
+    let query = strings[0] ?? "";
+    const params: unknown[] = [];
+    values.forEach((value, index) => {
+      params.push(value);
+      query += `$${index + 1}${strings[index + 1] ?? ""}`;
+    });
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "neon-connection-string": databaseUrl,
+      },
+      body: JSON.stringify({ query, params }),
+    });
+
+    const result = (await response.json()) as {
+      rows?: Record<string, unknown>[];
+      message?: string;
+      code?: string;
+      error?: string;
+    };
+
+    if (!response.ok) {
+      const error = new Error(result.message ?? result.error ?? "Database query failed.") as Error & { code?: string };
+      error.code = result.code;
+      throw error;
+    }
+
+    return result.rows ?? [];
+  };
+}
+
 export async function getSql() {
   assertPersistentStore();
   if (!process.env.DATABASE_URL) {
     throw new Error("DATABASE_URL is not set.");
   }
-  sql ??= neon(process.env.DATABASE_URL);
-  schemaReady ??= sql`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      password_salt TEXT NOT NULL
-    )
-  `.then(async () => {
+
+  sql ??= neonSql(process.env.DATABASE_URL);
+  schemaReady ??= (async () => {
+    await sql!`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        password_salt TEXT NOT NULL
+      )
+    `;
     await sql!`
       CREATE TABLE IF NOT EXISTS items (
         id TEXT PRIMARY KEY,
@@ -43,7 +82,7 @@ export async function getSql() {
       )
     `;
     await sql!`CREATE INDEX IF NOT EXISTS items_user_id_idx ON items (user_id)`;
-  });
+  })();
   await schemaReady;
   return sql;
 }

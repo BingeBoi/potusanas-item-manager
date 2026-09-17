@@ -4,6 +4,7 @@ import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { assertPersistentStore, getSql, isUniqueViolation, usesOnlineDatabase } from "@/lib/db";
 
 const scrypt = promisify(scryptCallback);
 const usersFile = path.join(process.cwd(), "data", "users.json");
@@ -43,31 +44,61 @@ function validCredentials(email: string, password: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && password.length >= 8;
 }
 
+async function findUser(email: string): Promise<StoredUser | undefined> {
+  assertPersistentStore();
+  if (usesOnlineDatabase()) {
+    const sql = await getSql();
+    const [user] = await sql`
+      SELECT id, email, password_hash AS "passwordHash", password_salt AS "passwordSalt"
+      FROM users
+      WHERE email = ${email}
+    `;
+    return user as StoredUser | undefined;
+  }
+  return (await getUsers()).find((candidate) => candidate.email === email);
+}
+
 export async function createUser(email: string, password: string): Promise<CurrentUser> {
   const normalizedEmail = normalizeEmail(email);
   if (!validCredentials(normalizedEmail, password)) {
     throw new Error("Use a valid email and a password with at least 8 characters.");
   }
 
-  const users = await getUsers();
-  if (users.some((user) => user.email === normalizedEmail)) {
+  if (await findUser(normalizedEmail)) {
     throw new Error("An account with this email already exists. Sign in instead.");
   }
 
   const passwordSalt = randomBytes(16).toString("hex");
-  const passwordHash = (await scrypt(password, passwordSalt, 64)) as Buffer;
+  const passwordHash = ((await scrypt(password, passwordSalt, 64)) as Buffer).toString("hex");
   const user: StoredUser = {
     id: randomBytes(16).toString("hex"),
     email: normalizedEmail,
-    passwordHash: passwordHash.toString("hex"),
+    passwordHash,
     passwordSalt,
   };
-  await saveUsers([...users, user]);
+
+  if (usesOnlineDatabase()) {
+    try {
+      const sql = await getSql();
+      await sql`
+        INSERT INTO users (id, email, password_hash, password_salt)
+        VALUES (${user.id}, ${user.email}, ${user.passwordHash}, ${user.passwordSalt})
+      `;
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw new Error("An account with this email already exists. Sign in instead.");
+      }
+      throw error;
+    }
+  } else {
+    await saveUsers([...(await getUsers()), user]);
+  }
+
   return { id: user.id, email: user.email };
 }
 
 export async function verifyUser(email: string, password: string): Promise<CurrentUser | null> {
-  const user = (await getUsers()).find((candidate) => candidate.email === normalizeEmail(email));
+  const user = await findUser(normalizeEmail(email));
   if (!user) return null;
 
   const attemptedHash = (await scrypt(password, user.passwordSalt, 64)) as Buffer;
