@@ -9,7 +9,16 @@ export function usesOnlineDatabase() {
   return Boolean(process.env.DATABASE_URL);
 }
 
+function isNextProductionBuild() {
+  return process.env.NEXT_PHASE === "phase-production-build";
+}
+
 export function assertPersistentStore() {
+  // `next build` sets NODE_ENV=production. Do not require DATABASE_URL while
+  // pages are compiled; Vercel only needs it when the live app reads/writes data.
+  if (isNextProductionBuild()) {
+    return;
+  }
   if (process.env.NODE_ENV === "production" && !process.env.DATABASE_URL) {
     throw new Error("DATABASE_URL must be configured in production.");
   }
