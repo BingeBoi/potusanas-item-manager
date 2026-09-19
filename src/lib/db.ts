@@ -26,7 +26,7 @@ export function assertPersistentStore() {
 
 function neonSql(databaseUrl: string): Sql {
   const parsed = new URL(databaseUrl);
-  const endpoint = `${parsed.protocol}//${parsed.host}/sql`;
+  const endpoint = `https://${parsed.host}/sql`;
 
   return async (strings, ...values) => {
     let query = strings[0] ?? "";
